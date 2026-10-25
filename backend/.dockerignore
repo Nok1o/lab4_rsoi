@@ -1,0 +1,4 @@
+.git
+.idea
+**/*_test.go
+deploy

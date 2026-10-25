@@ -1,0 +1,33 @@
+image:
+  repository: lab4_rsoi
+  tagPrefix: gateway-
+
+port: 8080
+
+env:
+  - name: LIBRARY_SERVICE_URL
+    value: http://library-service:8060
+  - name: RATING_SERVICE_URL
+    value: http://rating-service:8050
+  - name: RESERVATION_SERVICE_URL
+    value: http://reservation-service:8070
+  - name: REDIS_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: redis-credentials
+        key: REDIS_PASSWORD
+  # Kubernetes expands variables defined earlier in this list.
+  # The hex passwords generated in INFRASTRUCTURE.md are URL-safe.
+  - name: REDIS_URL
+    value: redis://:$(REDIS_PASSWORD)@library-infra-redis:6379/0
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+ingress:
+  enabled: true

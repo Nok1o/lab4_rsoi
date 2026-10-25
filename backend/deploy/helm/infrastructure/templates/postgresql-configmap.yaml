@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "infrastructure.postgresqlName" . }}-init
+  labels:
+    app.kubernetes.io/name: postgresql
+    {{- include "infrastructure.labels" . | nindent 4 }}
+data:
+  10-init.sql: |
+    {{- .Files.Get "files/postgresql/init.sql" | nindent 4 }}
+  libraries.sql: |
+    {{- required "Load postgresql.schemas.libraries using backend/deploy/infrastructure.sh" .Values.postgresql.schemas.libraries | nindent 4 }}
+  reservations.sql: |
+    {{- required "Load postgresql.schemas.reservations using backend/deploy/infrastructure.sh" .Values.postgresql.schemas.reservations | nindent 4 }}
+  ratings.sql: |
+    {{- required "Load postgresql.schemas.ratings using backend/deploy/infrastructure.sh" .Values.postgresql.schemas.ratings | nindent 4 }}

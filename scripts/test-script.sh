@@ -1,71 +1,172 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+variant="${1:-v4}"
+deployment="${2:-rating-service}"
+namespace="${3:-${KUBE_NAMESPACE:-library-system}}"
+if [[ "$variant" != v4 ]]; then
+  echo "This project's cloud test scenario supports variant v4." >&2
+  exit 2
+fi
+: "${BASE_URL:?Set BASE_URL to the cloud Gateway Ingress URL}"
+base_url="${BASE_URL%/}"
+if [[ ! "$base_url" =~ ^https?:// ]]; then
+  echo "BASE_URL must start with http:// or https://" >&2
+  exit 2
+fi
+wait_timeout="${TEST_WAIT_TIMEOUT:-180}"
+if [[ ! "$wait_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TEST_WAIT_TIMEOUT must be a positive number of seconds." >&2
+  exit 2
+fi
+for command in kubectl newman curl jq openssl; do
+  command -v "$command" >/dev/null
+done
 
-variant=${1:-${VARIANT}}
-deployment=${2:-${DEPLOYMENT_NAME}}
-namespace=${3:-${NAMESPACE}}
-
-[[ -z $namespace ]] && namespace="default"
-
-path=$(dirname "$0")
-
-timed() {
-  end=$(date +%s)
-  dt=$(($end - $1))
-  dd=$(($dt / 86400))
-  dt2=$(($dt - 86400 * $dd))
-  dh=$(($dt2 / 3600))
-  dt3=$(($dt2 - 3600 * $dh))
-  dm=$(($dt3 / 60))
-  ds=$(($dt3 - 60 * $dm))
-
-  LC_NUMERIC=C printf "\nTotal runtime: %02d min %02d seconds\n" "$dm" "$ds"
+project_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+library_uid="83575e12-7ce0-48ee-9931-51919ff3c9ee"
+book_uid="f7cdc58f-2caf-4b15-9727-f89dcc629b27"
+# A fresh user avoids the rating ceiling and does not touch Test Max's history.
+test_username="CI-$(date +%s)-$(openssl rand -hex 6)"
+selector="app.kubernetes.io/instance=$deployment"
+context_arguments=()
+if [[ -n "${KUBE_CONTEXT:-}" ]]; then
+  context_arguments=(--context "$KUBE_CONTEXT")
+fi
+kube() {
+  kubectl ${context_arguments[@]+"${context_arguments[@]}"} \
+    --request-timeout=15s --namespace "$namespace" "$@"
+}
+api() {
+  curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 20 \
+    --header "X-User-Name: $test_username" "$@"
+}
+wait_for_endpoints() {
+  local expected="$1" deadline=$((SECONDS + wait_timeout)) count
+  while (( SECONDS < deadline )); do
+    count="$(kube get endpointslices.discovery.k8s.io \
+      -l "kubernetes.io/service-name=$deployment" -o json |
+      jq '[.items[].endpoints[]? | select(.conditions.ready != false)] | length')" || return
+    if [[ "$expected" == up && "$count" -gt 0 ]] ||
+       [[ "$expected" == down && "$count" -eq 0 ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Timed out waiting for $deployment endpoints to be $expected." >&2
+  return 1
+}
+scale_and_wait() {
+  local replicas="$1" deadline=$((SECONDS + wait_timeout)) count
+  kube scale deployment "$deployment" --replicas="$replicas" || return
+  if (( replicas > 0 )); then
+    kube rollout status "deployment/$deployment" --timeout="${wait_timeout}s" || return
+    wait_for_endpoints up || return
+  else
+    while :; do
+      count="$(kube get pods -l "$selector" -o json | jq '.items | length')" || return
+      (( count == 0 )) && break
+      if (( SECONDS >= deadline )); then
+        echo "Timed out waiting for $deployment Pods to disappear." >&2
+        return 1
+      fi
+      sleep 2
+    done
+    wait_for_endpoints down || return
+  fi
 }
 
-success() {
-  newman run \
-    --delay-request=100 \
-    --folder=success \
-    --export-environment "$variant"/postman/environment.json \
-    --environment "$variant"/postman/environment.json \
-    "$variant"/postman/collection.json
+original_replicas="$(kube get deployment "$deployment" -o jsonpath='{.spec.replicas}')"
+if [[ ! "$original_replicas" =~ ^[1-9][0-9]*$ ]]; then
+  echo "$deployment must be running before tests; current replicas=$original_replicas." >&2
+  exit 1
+fi
+temporary_directory="$(mktemp -d)"
+report_directory="${TEST_REPORT_DIR:-$(mktemp -d)}"
+mkdir -p "$report_directory"
+environment_file="$temporary_directory/environment.json"
+collection_file="$temporary_directory/collection.json"
+tests_started=0
+start=$SECONDS
+cleanup() {
+  local status=$? cleanup_status=0 reservations uid
+  trap - EXIT INT TERM
+  set +e
+  # Explicit error checks matter: cleanup runs with errexit disabled.
+  scale_and_wait "$original_replicas" || cleanup_status=1
+  if (( tests_started )); then
+    # Query the API, not reservationUid: a failed assertion may prevent its export.
+    reservations="$(api "$base_url/api/v1/reservations")"
+    if [[ $? != 0 ]] || ! jq -e 'type == "array"' <<< "$reservations" >/dev/null; then
+      echo "Could not inspect reservations for $test_username; manual cleanup may be needed." >&2
+      cleanup_status=1
+    else
+      while IFS= read -r uid; do
+        [[ -z "$uid" ]] && continue
+        echo "Returning unfinished test reservation $uid for $test_username."
+        api --request POST --header "Content-Type: application/json" \
+          --data '{"condition":"EXCELLENT","date":"2021-10-11"}' \
+          "$base_url/api/v1/reservations/$uid/return" >/dev/null || cleanup_status=1
+      done < <(jq -r --arg library "$library_uid" --arg book "$book_uid" \
+        '.[] | select(.status == "RENTED" and .library.libraryUid == $library and .book.bookUid == $book) | .reservationUid' \
+        <<< "$reservations")
+    fi
+  fi
+  rm -f "$environment_file" "$collection_file"
+  rmdir "$temporary_directory"
+  printf '\nTest user: %s\nReports: %s\nTotal runtime: %s seconds\n' \
+    "$test_username" "$report_directory" "$((SECONDS - start))"
+  if (( cleanup_status != 0 )); then
+    echo "Recovery was incomplete. Check Rating replicas and this test user's reservations." >&2
+    (( status == 0 )) && status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Leave the original collection and its assertions unchanged. Override only its
+# fixed username in a temporary copy, after the folder's original prerequest code.
+jq --arg username "$test_username" \
+  '(.item[] | select(.name == "success" or .name == "failover")
+    | .event[] | select(.listen == "prerequest") | .script.exec)
+    += ["pm.environment.set(\"username\", " + ($username | tojson) + ");"]' \
+  "$project_directory/$variant/postman/collection.json" > "$collection_file"
+jq --arg base "$base_url" \
+  '.values = ([.values[] | select(.key != "baseUrl")] +
+    [{key: "baseUrl", value: $base, enabled: true}])' \
+  "$project_directory/$variant/postman/environment.json" > "$environment_file"
+jq --null-input --arg user "$test_username" --arg base "$base_url" \
+  --argjson replicas "$original_replicas" \
+  '{username: $user, baseUrl: $base, originalReplicas: $replicas}' \
+  > "$report_directory/context.json"
+
+echo "Testing $base_url in namespace=$namespace, username=$test_username."
+kube rollout status "deployment/$deployment" --timeout="${wait_timeout}s"
+wait_for_endpoints up
+curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+  --retry 12 --retry-delay 2 --retry-all-errors "$base_url/manage/health" >/dev/null
+# Do not cancel someone else's reservation to make the suite pass.
+books="$(api "$base_url/api/v1/libraries/$library_uid/books?showAll=true&page=1&size=100")"
+if ! jq -e --arg book "$book_uid" \
+  '.items[] | select(.bookUid == $book and .availableCount > 0 and .condition == "EXCELLENT")' \
+  <<< "$books" >/dev/null; then
+  echo "The seeded test book is missing, occupied or not EXCELLENT. Restore the fixture before running; no other user's data was changed." >&2
+  exit 1
+fi
+run_folder() {
+  newman run "$collection_file" --environment "$environment_file" \
+    --export-environment "$environment_file" --folder "$1" --delay-request 100 \
+    --timeout-request 15000 --timeout-script 40000 --timeout 180000 \
+    --reporters cli,json --reporter-json-export "$report_directory/$1.json"
 }
 
-step() {
-  local step=$1
-  [[ $((step % 2)) -eq 0 ]] && replicas=1 || replicas=0
-
-  printf "=== Step %d: scale %s to %s ===\n" "$step" "$deployment" "$replicas"
-
-  kubectl scale deployment "$deployment" -n "$namespace" --replicas "$replicas" 
-
-  newman run \
-    --delay-request=100 \
-    --folder=step"$step" \
-    --export-environment "$variant"/postman/environment.json \
-    --environment "$variant"/postman/environment.json \
-    "$variant"/postman/collection.json
-
-  printf "=== Step %d completed ===\n" "$step"
-}
-
-start=$(date +%s)
-trap 'timed $start' EXIT
-
-printf "=== Start test scenario ===\n"
-
-# success execute
-success
-
-# stop service
-step 1
-
-# start service
-step 2
-
-# stop service
-step 3
-
-# start service
-step 4
+tests_started=1
+run_folder success
+for step in 1 2 3 4; do
+  if (( step % 2 )); then replicas=0; else replicas="$original_replicas"; fi
+  echo "=== Step $step: scale $deployment to $replicas ==="
+  scale_and_wait "$replicas"
+  run_folder "step$step"
+done

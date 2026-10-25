@@ -1,0 +1,22 @@
+image:
+  repository: lab4_rsoi
+  tagPrefix: library-
+
+port: 8060
+
+env:
+  - name: DB_HOST
+    value: library-infra-postgresql
+  - name: DB_PORT
+    value: "5432"
+  - name: DB_NAME
+    value: libraries
+  - name: DB_USER
+    value: library_service
+  - name: DB_SSLMODE
+    value: disable
+  - name: DB_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: postgresql-credentials
+        key: LIBRARIES_DB_PASSWORD

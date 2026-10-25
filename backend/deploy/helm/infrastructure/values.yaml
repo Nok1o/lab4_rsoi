@@ -1,0 +1,33 @@
+postgresql:
+  image: postgres:17.11-bookworm
+  existingSecret: postgresql-credentials
+  storage:
+    className: yc-network-ssd
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  # Loaded from the existing postgres/scripts/schema-*.sql by infrastructure.sh.
+  schemas:
+    libraries: ""
+    reservations: ""
+    ratings: ""
+
+redis:
+  image: redis:7.4.8-alpine
+  existingSecret: redis-credentials
+  storage:
+    className: yc-network-ssd
+    size: 1Gi
+  maxmemory: 256mb
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

@@ -1,0 +1,63 @@
+replicaCount: 1
+
+image:
+  registry: docker.io
+  # Docker Hub user/organization, not a Kubernetes namespace.
+  namespace: ""
+  repository: ""
+  tag: ""
+  # Optional prefix: permits different services in one Docker Hub repository.
+  tagPrefix: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The container and ClusterIP Service use the same HTTP port.
+# PORT is added to the container environment by the chart.
+port: 8080
+
+# Standard Kubernetes EnvVar list. Order is preserved for $(VARIABLE) references.
+# Do not add PORT here; change port above instead.
+env: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+startupProbe:
+  httpGet:
+    path: /manage/health
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 30
+
+readinessProbe:
+  httpGet:
+    path: /manage/health
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2
+
+livenessProbe:
+  httpGet:
+    path: /manage/health
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+ingress:
+  enabled: false
+  className: traefik
+  # Empty host permits access by the load balancer IP.
+  host: ""
+  path: /
+  pathType: Prefix
+  annotations: {}
+  tls: []
