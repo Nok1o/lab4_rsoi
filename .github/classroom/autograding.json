@@ -3,11 +3,11 @@
     {
       "name": "Run Test Script",
       "setup": "",
-      "run": "bash scripts/test-script.sh v4 rating-service library-system",
+      "run": "bash -c 'source .github/classroom/cloud-test.env && exec bash scripts/test-script.sh v4 rating-service library-system'",
       "input": "",
       "output": "",
       "comparison": "included",
-      "timeout": 1200,
+      "timeout": 20,
       "points": 10
     }
   ]

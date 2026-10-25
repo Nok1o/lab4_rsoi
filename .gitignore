@@ -1245,3 +1245,6 @@ buildNumber.properties
 # Keep the cloud test harness despite the generic virtualenv Scripts rule.
 !/scripts/
 !/scripts/test-script-test.sh
+
+# Runtime bridge for education/autograding's sanitized child environment.
+/.github/classroom/cloud-test.env

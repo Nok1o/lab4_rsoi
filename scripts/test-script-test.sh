@@ -7,6 +7,7 @@ exec python3 - "$script_dir" <<'PY'
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -389,6 +390,95 @@ class KubernetesConfigurationTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertEqual(original, self.output.read_text())
         self.assertNotIn(self.token, result.stdout + result.stderr)
+
+
+class ClassroomEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="lab4-classroom-test-")
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / ".github/classroom").mkdir(parents=True)
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts/test-script.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "exec python3 - \"$@\" <<'CAPTURE'\n"
+            "import json, os, sys\n"
+            "print(json.dumps({'variables': dict(os.environ), 'arguments': sys.argv[1:]}))\n"
+            "CAPTURE\n"
+        )
+        configuration = json.loads((ROOT / ".github/classroom/autograding.json").read_text())
+        self.command = configuration["tests"][0]["run"]
+        # Match the environment whitelist used by education/autograding@v1,
+        # intentionally dropping the workflow's other environment variables.
+        self.child_environment = {"HOME": str(self.root), "PATH": os.environ["PATH"]}
+        self.expected = {
+            "BASE_URL": "https://cloud.example.invalid/path with spaces?q='\"&value=$HOME;$(touch OWNED)",
+            "KUBECONFIG": str(self.root / "runner files" / "ci 'quoted'.config"),
+            "TEST_REPORT_DIR": str(self.root / 'reports "quoted" and $(touch OWNED)') + "\nsecond line",
+        }
+
+    def preparation_script(self):
+        lines = (ROOT / ".github/workflows/classroom.yml").read_text().splitlines()
+        name = "      - name: Prepare environment for Classroom test process"
+        self.assertIn(name, lines, "The real workflow must prepare the Classroom subprocess environment")
+        start = lines.index(name) + 1
+        finish = next((index for index in range(start, len(lines))
+                       if lines[index].startswith("      - ")), len(lines))
+        step = lines[start:finish]
+        self.assertIn("        run: |", step)
+        run = step[step.index("        run: |") + 1:]
+        self.assertTrue(all(not line.strip() or line.startswith("          ") for line in run))
+        return "\n".join(line[10:] for line in run) + "\n"
+
+    def run_classroom(self):
+        return subprocess.run(
+            ["bash", "-c", self.command], cwd=self.root,
+            env=self.child_environment, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10,
+        )
+
+    def test_actual_workflow_transfers_only_required_values_to_sanitized_classroom(self):
+        preparation_environment = dict(os.environ, **self.expected)
+        preparation_environment.update(
+            ARBITRARY_SECRET="dummy-secret-that-must-not-be-transferred",
+            YC_IAM_TOKEN="dummy-iam-token-that-must-not-be-transferred",
+            DOCKERHUB_TOKEN="dummy-docker-token-that-must-not-be-transferred",
+        )
+        preparation = subprocess.run(
+            ["bash", "-e", "-c", self.preparation_script()], cwd=self.root,
+            env=preparation_environment, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10,
+        )
+        self.assertEqual(0, preparation.returncode, preparation.stderr)
+        environment_file = self.root / ".github/classroom/cloud-test.env"
+        self.assertEqual(0o600, environment_file.stat().st_mode & 0o777)
+        exports = re.findall(r"^export ([A-Z_]+)=", environment_file.read_text(), re.MULTILINE)
+        self.assertEqual(sorted(self.expected), sorted(exports))
+        for name in ("ARBITRARY_SECRET", "YC_IAM_TOKEN", "DOCKERHUB_TOKEN"):
+            self.assertNotIn(preparation_environment[name], environment_file.read_text())
+            self.assertNotIn(preparation_environment[name], preparation.stdout + preparation.stderr)
+        result = self.run_classroom()
+        self.assertEqual(0, result.returncode, result.stderr)
+        captured = json.loads(result.stdout)
+        self.assertEqual(["v4", "rating-service", "library-system"], captured["arguments"])
+        for name, value in self.expected.items():
+            self.assertEqual(value, captured["variables"].get(name), name)
+        # Bash/Python may add platform variables (e.g. LC_CTYPE or macOS
+        # __CF_USER_TEXT_ENCODING); compare against a clean child baseline.
+        baseline = subprocess.run(
+            ["bash", "scripts/test-script.sh"], cwd=self.root,
+            env=self.child_environment, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10,
+        )
+        self.assertEqual(0, baseline.returncode, baseline.stderr)
+        allowed = set(self.expected) | set(json.loads(baseline.stdout)["variables"])
+        self.assertFalse(set(captured["variables"]) - allowed, captured["variables"])
+        self.assertFalse((self.root / "OWNED").exists(), "Quoted values must never execute as shell code")
+
+    def test_actual_autograding_command_fails_when_environment_file_is_missing(self):
+        result = self.run_classroom()
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("", result.stdout, "The test runner must not start without its prepared environment")
 
 
 unittest.main(verbosity=2)

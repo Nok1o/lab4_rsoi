@@ -133,6 +133,14 @@ jobs:
             get deployment rating-service -o jsonpath='{.spec.replicas}')"
           [[ "$replicas" =~ ^[1-9][0-9]*$ ]]
           echo "replicas=$replicas" >> "$GITHUB_OUTPUT"
+      - name: Prepare environment for Classroom test process
+        run: |
+          # Autograding v1 does not inherit the job environment.
+          # Pass only the URL and paths, never cloud/Docker credentials.
+          umask 077
+          printf 'export BASE_URL=%q\nexport KUBECONFIG=%q\nexport TEST_REPORT_DIR=%q\n' \
+            "$BASE_URL" "$KUBECONFIG" "$TEST_REPORT_DIR" \
+            > .github/classroom/cloud-test.env
       - name: Autograding — success and failover against cloud Ingress
         uses: education/autograding@v1
       - name: Restore Rating even if tests failed
@@ -162,6 +170,6 @@ jobs:
           path: ${{ env.TEST_REPORT_DIR }}
           if-no-files-found: ignore
           retention-days: 7
-      - name: Remove temporary Kubernetes credentials
+      - name: Remove temporary test configuration and Kubernetes credentials
         if: always() && env.KUBECONFIG != ''
-        run: rm -f "$KUBECONFIG"
+        run: rm -f "$KUBECONFIG" .github/classroom/cloud-test.env

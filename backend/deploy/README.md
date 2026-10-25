@@ -66,7 +66,7 @@ IAM и OIDC уже созданы:
 
 - CI service account: ajen3g2nl7o039bakoq6.
 - Федерация: ajejtmjom45icm85fnc3.
-- Доверенный subject: repo:Nok1o/lab4_rsoi:ref:refs/heads/master.
+- Доверенный subject: repo:Nok1o@147308854/lab4_rsoi@1433093555:ref:refs/heads/master.
 
 Выдать аккаунту роль только в library-system (администраторским контекстом):
 
