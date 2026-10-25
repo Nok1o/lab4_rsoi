@@ -17,7 +17,7 @@ env:
         name: redis-credentials
         key: REDIS_PASSWORD
   # Kubernetes expands variables defined earlier in this list.
-  # The hex passwords generated in INFRASTRUCTURE.md are URL-safe.
+  # The hex passwords generated in backend/deploy/README.md are URL-safe.
   - name: REDIS_URL
     value: redis://:$(REDIS_PASSWORD)@library-infra-redis:6379/0
 

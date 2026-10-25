@@ -1234,3 +1234,14 @@ buildNumber.properties
 .mvn/timing.properties
 # https://github.com/takari/maven-wrapper#usage-without-binary-jar
 .mvn/wrapper/maven-wrapper.jar
+
+# Go module and database initialization scripts are application sources.
+!/backend/go.mod
+!/backend/shared/log/
+!/backend/shared/log/*.go
+!/postgres/scripts/
+!/postgres/scripts/*.sql
+
+# Keep the cloud test harness despite the generic virtualenv Scripts rule.
+!/scripts/
+!/scripts/test-script-test.sh

@@ -1,35 +1,167 @@
 name: GitHub Classroom Workflow
+
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   pull_request:
-    branches:
-      - master
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Autograding
+  check:
+    name: Build and unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
         with:
-          fetch-depth: 0
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build, test and vet
+        working-directory: backend
+        run: |
+          go build ./...
+          go test -race ./...
+          go vet ./...
+      - name: Check cloud test orchestrator without accessing the cloud
+        run: |
+          for script in scripts/*.sh backend/deploy/*.sh; do
+            bash -n "$script"
+          done
+          bash scripts/test-script-test.sh
+      - uses: azure/setup-helm@v4.3.1
+        with:
+          version: v4.3.1
+      - name: Lint Helm charts
+        run: |
+          bash backend/deploy/infrastructure.sh lint
+          bash backend/deploy/application.sh lint
 
-      - uses: docker/setup-buildx-action@v2
-
-      # TODO build and run unit tests
-
+  cloud:
+    name: Autograding
+    needs: check
+    # No cloud credentials or Docker Hub token are available to PR jobs.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      checks: write
+    concurrency:
+      # Serialize every deploy/test targeting the same shared environment.
+      group: lab4-cloud-library-system
+      cancel-in-progress: false
+    env:
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'nok1o' }}
+      DOCKERHUB_REPOSITORY: lab4_rsoi
+      IMAGE_TAG: sha-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBE_NAMESPACE: library-system
+      BASE_URL: ${{ vars.APP_BASE_URL }}
+      KUBE_CLUSTER_JSON: ${{ vars.KUBE_CLUSTER_JSON }}
+      YC_SERVICE_ACCOUNT_ID: ${{ vars.YC_SERVICE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required configuration
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          : "${DOCKERHUB_TOKEN:?Add the DOCKERHUB_TOKEN repository secret}"
+          : "${BASE_URL:?Add the APP_BASE_URL repository variable (Gateway Ingress URL)}"
+          : "${KUBE_CLUSTER_JSON:?Add KUBE_CLUSTER_JSON using export-cluster-config.sh}"
+          : "${YC_SERVICE_ACCOUNT_ID:?Add the dedicated IAM service account ID}"
+          echo "TEST_REPORT_DIR=$RUNNER_TEMP/lab4-test-reports" >> "$GITHUB_ENV"
+          echo "KUBECONFIG=$RUNNER_TEMP/lab4-ci.kubeconfig" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_NAMESPACE }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Build images
-        timeout-minutes: 10
-        run: docker compose build --push
-
-      # TODO deploy to k8s with liveness and readyness probes
-
-      - name: Wait before services are ready
-        run: kubectl wait -n test -l app.kubernetes.io/name=gateway pod --for=condition=Ready --timeout 3m
-      
-      # TODO setup parameters in classroom/autograding.json
-      
-      - name: Autograding
+        run: bash backend/deploy/images.sh build
+      - name: Push the same images
+        run: bash backend/deploy/images.sh push
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.35.1
+      - uses: azure/setup-helm@v4.3.1
+        with:
+          version: v4.3.1
+      - name: Exchange GitHub OIDC identity for a temporary Yandex IAM token
+        id: iam
+        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
+        with:
+          yc-sa-id: ${{ env.YC_SERVICE_ACCOUNT_ID }}
+      - name: Configure Kubernetes access for this job only
+        env:
+          YC_IAM_TOKEN: ${{ steps.iam.outputs.token }}
+        run: bash backend/deploy/configure-ci-kubeconfig.sh
+      - name: Verify identity, namespace access and privilege boundary
+        run: |
+          kubectl --request-timeout=15s auth whoami
+          kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" get deployments
+          test "$(kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" \
+            auth can-i patch deployments/rating-service --subresource=scale)" = yes
+          if answer="$(kubectl --request-timeout=15s -n kube-system auth can-i get secrets)"; then
+            echo "CI must not have access to kube-system Secrets." >&2
+            exit 1
+          else
+            test "$answer" = no
+          fi
+          if answer="$(kubectl --request-timeout=15s auth can-i create clusterrolebindings)"; then
+            echo "CI must not be allowed to grant cluster-wide permissions." >&2
+            exit 1
+          else
+            test "$answer" = no
+          fi
+      - name: Deploy all four services and wait for readiness
+        run: bash backend/deploy/application.sh deploy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Newman
+        run: npm install --global newman@6.2.1
+      - name: Save Rating replica count for emergency recovery
+        id: rating
+        run: |
+          replicas="$(kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" \
+            get deployment rating-service -o jsonpath='{.spec.replicas}')"
+          [[ "$replicas" =~ ^[1-9][0-9]*$ ]]
+          echo "replicas=$replicas" >> "$GITHUB_OUTPUT"
+      - name: Autograding — success and failover against cloud Ingress
         uses: education/autograding@v1
+      - name: Restore Rating even if tests failed
+        if: always() && steps.rating.outcome == 'success'
+        env:
+          ORIGINAL_REPLICAS: ${{ steps.rating.outputs.replicas }}
+        run: |
+          kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" scale \
+            deployment rating-service --replicas="$ORIGINAL_REPLICAS"
+          kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" rollout status \
+            deployment/rating-service --timeout=180s
+      - name: Collect diagnostics on failure
+        if: failure() && steps.iam.outcome == 'success'
         continue-on-error: true
+        run: |
+          kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" get pods,svc,ingress
+          kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" get events \
+            --sort-by=.lastTimestamp | tail -n 60
+          for service in gateway library rating reservation; do
+            kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" logs \
+              "deployment/$service-service" --all-containers --tail=100 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cloud-newman-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TEST_REPORT_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove temporary Kubernetes credentials
+        if: always() && env.KUBECONFIG != ''
+        run: rm -f "$KUBECONFIG"
