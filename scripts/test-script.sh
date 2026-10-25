@@ -41,6 +41,32 @@ api() {
   curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 20 \
     --header "X-User-Name: $test_username" "$@"
 }
+wait_for_rating() {
+  local deadline=$((SECONDS + wait_timeout)) status
+  echo "Waiting for Rating recovery through Gateway."
+  while (( SECONDS < deadline )); do
+    status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+      --header "X-User-Name: $test_username" \
+      --output "$report_directory/rating-readiness.json" --write-out '%{http_code}' \
+      "$base_url/api/v1/rating")" || return
+    case "$status" in
+      200)
+        if ! jq -e '.stars | type == "number"' "$report_directory/rating-readiness.json" >/dev/null; then
+          echo "Rating readiness returned HTTP 200 with an invalid rating body." >&2
+          return 1
+        fi
+        return 0
+        ;;
+      503) sleep 2 ;;
+      *)
+        echo "Rating readiness returned unexpected HTTP $status." >&2
+        return 1
+        ;;
+    esac
+  done
+  echo "Timed out waiting for Rating recovery through Gateway (last HTTP $status)." >&2
+  return 1
+}
 wait_for_endpoints() {
   local expected="$1" deadline=$((SECONDS + wait_timeout)) count
   while (( SECONDS < deadline )); do
@@ -168,5 +194,10 @@ for step in 1 2 3 4; do
   if (( step % 2 )); then replicas=0; else replicas="$original_replicas"; fi
   echo "=== Step $step: scale $deployment to $replicas ==="
   scale_and_wait "$replicas"
+  # Pod/EndpointSlice readiness alone does not prove that Gateway can reach
+  # the new Pod or that its circuit breaker has completed recovery.
+  if (( replicas > 0 )); then
+    wait_for_rating
+  fi
   run_folder "step$step"
 done

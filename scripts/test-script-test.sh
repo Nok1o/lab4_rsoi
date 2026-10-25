@@ -47,6 +47,9 @@ def option(name, default=None):
 
 event("command", command=command, args=args)
 if command == "sleep":
+    if os.environ.get("MOCK_SLEEP_REAL") == "1":
+        import time
+        time.sleep(float(args[0]))
     sys.exit(0)
 if command == "kubectl":
     if option("-n", option("--namespace")) != "library-system":
@@ -150,7 +153,17 @@ elif command == "curl":
         }]})
         status = "200"
     elif path.endswith("/rating"):
-        body, status = '{"stars":75}', "200"
+        if option("--header") != "X-User-Name: " + state.get("username", "ci-mock"):
+            sys.exit("Rating readiness must use the isolated test user")
+        state["rating_probes"] = state.get("rating_probes", 0) + 1
+        status = os.environ.get("RATING_PROBE_STATUS") or (
+            "503" if state["rating_probes"] <= int(os.environ.get("RATING_PROBE_FAILURES", "0"))
+            else "200")
+        event("rating_probe", status=status)
+        save()
+        body = '{"stars":75}' if status == "200" else '{"message":"not ready"}'
+        if os.environ.get("RATING_PROBE_INVALID_RESPONSE") == "1":
+            body = '{"stars":"not a number"}'
     elif path.endswith("/health"):
         body, status = "{}", "200"
     else:
@@ -218,6 +231,14 @@ class CloudScenarioTests(unittest.TestCase):
             ("scale", 2),
         ], sequence)
         self.assertEqual(2, state["replicas"])
+        for folder in ("step2", "step4"):
+            folder_index = next(index for index, event in enumerate(events)
+                                if event["kind"] == "folder" and event["folder"] == folder)
+            scale_index = max(index for index in range(folder_index)
+                              if events[index]["kind"] == "scale")
+            probes = [event["status"] for event in events[scale_index + 1:folder_index]
+                      if event["kind"] == "rating_probe"]
+            self.assertEqual(["200"], probes, "Readiness must pass after scale-up, before " + folder)
 
     def test_failure_restores_replicas_and_returns_own_rental(self):
         result, events, state = self.run_scenario(FAIL_FOLDER="step2")
@@ -257,6 +278,46 @@ class CloudScenarioTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode, result.stdout)
         self.assertFalse(any(event["kind"] in ("folder", "return") for event in events))
         self.assertEqual(2, state["replicas"])
+
+    def test_rating_readiness_retries_temporary_503_before_step2(self):
+        result, events, state = self.run_scenario(RATING_PROBE_FAILURES="2")
+        self.assertEqual(0, result.returncode, result.stdout)
+        statuses = [event["status"] for event in events if event["kind"] == "rating_probe"]
+        self.assertEqual(["503", "503", "200", "200"], statuses)
+        step2_index = next(index for index, event in enumerate(events)
+                           if event["kind"] == "folder" and event["folder"] == "step2")
+        self.assertEqual(["503", "503", "200"],
+                         [event["status"] for event in events[:step2_index]
+                          if event["kind"] == "rating_probe"])
+        self.assertEqual(2, state["replicas"])
+
+    def test_rating_readiness_fails_permanent_status_without_running_step2(self):
+        result, events, state = self.run_scenario(RATING_PROBE_STATUS="400")
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertEqual(["success", "step1"],
+                         [event["folder"] for event in events if event["kind"] == "folder"])
+        self.assertEqual(["400"], [event["status"] for event in events if event["kind"] == "rating_probe"])
+        self.assertEqual(2, state["replicas"])
+
+    def test_rating_readiness_times_out_without_greenlighting_step2(self):
+        result, events, state = self.run_scenario(
+            RATING_PROBE_STATUS="503", TEST_WAIT_TIMEOUT="1", MOCK_SLEEP_REAL="1")
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertEqual(["success", "step1"],
+                         [event["folder"] for event in events if event["kind"] == "folder"])
+        statuses = [event["status"] for event in events if event["kind"] == "rating_probe"]
+        self.assertTrue(statuses, result.stdout)
+        self.assertEqual({"503"}, set(statuses))
+        self.assertEqual(2, state["replicas"])
+
+    def test_rating_readiness_rejects_malformed_200_body(self):
+        result, events, state = self.run_scenario(RATING_PROBE_INVALID_RESPONSE="1")
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertEqual(["success", "step1"],
+                         [event["folder"] for event in events if event["kind"] == "folder"])
+        self.assertEqual(["200"], [event["status"] for event in events if event["kind"] == "rating_probe"])
+        self.assertEqual(2, state["replicas"])
+        self.assertIn("invalid rating body", result.stdout)
 
 
 class KubernetesConfigurationTests(unittest.TestCase):
