@@ -1,0 +1,52 @@
+githubConfigUrl: https://github.com/Nok1o/lab4_rsoi
+# Created manually, never supplied inline to Helm or mounted in runner jobs.
+githubConfigSecret: arc-github-credentials
+runnerScaleSetName: lab4-cloud-runner
+minRunners: 0
+maxRunners: 1
+controllerServiceAccount:
+  namespace: arc-system
+  name: arc-controller
+listenerTemplate:
+  spec:
+    containers:
+      - name: listener
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+template:
+  spec:
+    serviceAccountName: github-actions-app-deployer
+    automountServiceAccountToken: true
+    nodeSelector:
+      kubernetes.io/os: linux
+      kubernetes.io/arch: amd64
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      runAsGroup: 1001
+      fsGroup: 1001
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: runner
+        image: docker.io/nok1o/lab4_rsoi:ci-runner-v1
+        imagePullPolicy: IfNotPresent
+        command: [/home/runner/run.sh]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+            ephemeral-storage: 1Gi
+          limits:
+            cpu: '1'
+            memory: 1536Mi
+            ephemeral-storage: 4Gi

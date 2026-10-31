@@ -1,5 +1,12 @@
 # Applied manually by an administrator, never by the application workflow.
-# The matching RoleBinding is created for the dedicated IAM account ID.
+# Runner jobs authenticate directly as a Kubernetes ServiceAccount, not via IAM.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-actions-app-deployer
+  namespace: arc-runners
+automountServiceAccountToken: true
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -36,3 +43,17 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-actions-app-deployer
+  namespace: library-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: github-actions-app-deployer
+subjects:
+  - kind: ServiceAccount
+    name: github-actions-app-deployer
+    namespace: arc-runners

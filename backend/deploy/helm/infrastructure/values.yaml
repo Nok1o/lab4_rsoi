@@ -2,7 +2,7 @@ postgresql:
   image: postgres:17.11-bookworm
   existingSecret: postgresql-credentials
   storage:
-    className: yc-network-ssd
+    className: gp3
     size: 10Gi
   resources:
     requests:
@@ -21,7 +21,7 @@ redis:
   image: redis:7.4.8-alpine
   existingSecret: redis-credentials
   storage:
-    className: yc-network-ssd
+    className: gp3
     size: 1Gi
   maxmemory: 256mb
   resources:

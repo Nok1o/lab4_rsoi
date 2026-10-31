@@ -321,128 +321,81 @@ class CloudScenarioTests(unittest.TestCase):
 
 
 class KubernetesConfigurationTests(unittest.TestCase):
-    token = "offline-dummy-iam-token"
-    ca = "ZHVtbXktY2EtZm9yLW9mZmxpbmUtdGVzdHM="
-    endpoint = "https://cluster.example.invalid"
+    token = "offline-dummy-service-account-token"
+    ca = "offline-test-ca"
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="lab4-kubeconfig-test-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.output = self.root / "ci.kubeconfig"
+        self.mount = self.root / "service account"
+        self.mount.mkdir()
+        (self.mount / "token").write_text(self.token)
+        (self.mount / "ca.crt").write_text(self.ca)
         self.environment = os.environ.copy()
         self.environment.update(
             KUBECONFIG=str(self.output),
-            YC_IAM_TOKEN=self.token,
+            KUBE_SERVICE_ACCOUNT_DIRECTORY=str(self.mount),
             KUBE_NAMESPACE="library-system",
-            KUBE_CONTEXT="offline-test",
         )
 
-    def configure(self, source=None, **overrides):
-        if source is None:
-            source = {"server": self.endpoint, "certificate-authority-data": self.ca}
-        environment = dict(self.environment, KUBE_CLUSTER_JSON=json.dumps(source), **overrides)
+    def configure(self, **overrides):
         return subprocess.run(
             ["bash", str(ROOT / "backend/deploy/configure-ci-kubeconfig.sh")],
-            cwd=self.root, env=environment, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=10,
+            cwd=self.root, env=dict(self.environment, **overrides),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
         )
 
-    def export(self, cluster):
-        binary_dir = self.root / "bin"
-        binary_dir.mkdir(exist_ok=True)
-        kubectl = binary_dir / "kubectl"
-        kubectl.write_text(
-            "#!/usr/bin/env python3\n"
-            "import os, sys\n"
-            "assert 'config' in sys.argv and 'view' in sys.argv\n"
-            "assert '--minify' in sys.argv and '--flatten' in sys.argv and '--raw' in sys.argv\n"
-            "sys.stdout.write(os.environ['MOCK_KUBECONFIG'])\n"
-        )
-        kubectl.chmod(0o755)
-        environment = dict(self.environment)
-        environment.update(
-            PATH=str(binary_dir) + os.pathsep + environment["PATH"],
-            MOCK_KUBECONFIG=json.dumps({
-                "clusters": [{"name": "offline-test", "cluster": cluster}],
-                "users": [{"name": "administrator", "user": {
-                    "token": self.token,
-                    "client-key-data": "must-not-be-exported",
-                    "exec": {"command": "must-not-be-executed"},
-                }}],
-            }),
-        )
-        return subprocess.run(
-            ["bash", str(ROOT / "backend/deploy/export-cluster-config.sh")],
-            cwd=self.root, env=environment, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=10,
-        )
-
-    def test_temporary_kubeconfig_is_private_and_token_is_not_printed(self):
+    def test_temporary_kubeconfig_is_private_and_does_not_copy_token(self):
         result = self.configure()
         self.assertEqual(0, result.returncode, result.stderr)
         config = json.loads(self.output.read_text())
         self.assertEqual(0o600, self.output.stat().st_mode & 0o777)
-        self.assertEqual(self.token, config["users"][0]["user"]["token"])
-        self.assertEqual("library-system", config["contexts"][0]["context"]["namespace"])
-        self.assertEqual(self.endpoint, config["clusters"][0]["cluster"]["server"])
-        self.assertNotIn(self.token, result.stdout + result.stderr)
-
-    def test_export_contains_only_endpoint_and_embedded_ca(self):
-        result = self.export({
-            "server": self.endpoint, "certificate-authority-data": self.ca,
-            "proxy-url": "https://untrusted-proxy.example.invalid",
-            "tls-server-name": "untrusted-name",
-        })
-        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            {"tokenFile": str(self.mount / "token")}, config["users"][0]["user"],
+        )
         self.assertEqual({
-            "server": self.endpoint, "certificate-authority-data": self.ca,
-        }, json.loads(result.stdout))
-        self.assertNotIn(self.token, result.stdout + result.stderr)
-        self.assertNotIn("must-not-be", result.stdout + result.stderr)
+            "server": "https://kubernetes.default.svc:443",
+            "certificate-authority": str(self.mount / "ca.crt"),
+        }, config["clusters"][0]["cluster"])
+        self.assertEqual("library-system", config["contexts"][0]["context"]["namespace"])
+        self.assertNotIn(self.token, self.output.read_text() + result.stdout + result.stderr)
+        self.assertNotIn("exec", config["users"][0]["user"])
 
-    def test_export_rejects_insecure_or_missing_ca_configuration(self):
-        for cluster in (
-            {"server": "http://cluster.example.invalid", "certificate-authority-data": self.ca},
-            {"server": self.endpoint, "certificate-authority-data": self.ca,
-             "insecure-skip-tls-verify": True},
-            {"server": self.endpoint},
-        ):
-            with self.subTest(cluster=cluster):
-                result = self.export(cluster)
-                self.assertNotEqual(0, result.returncode)
-                self.assertEqual("", result.stdout)
+    def test_token_file_reference_survives_rotation_and_sanitized_environment(self):
+        result = self.configure()
+        self.assertEqual(0, result.returncode, result.stderr)
+        # No AWS/GitHub/job environment is needed to locate the projected token.
+        code = (
+            "import json, pathlib, sys; "
+            "config = json.loads(pathlib.Path(sys.argv[1]).read_text()); "
+            "print(pathlib.Path(config['users'][0]['user']['tokenFile']).read_text())"
+        )
+        for token in (self.token, "rotated-service-account-token"):
+            (self.mount / "token").write_text(token)
+            child = subprocess.run(
+                ["python3", "-c", code, str(self.output)],
+                env={"PATH": os.environ["PATH"], "HOME": str(self.root)},
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            )
+            self.assertEqual(0, child.returncode, child.stderr)
+            self.assertEqual(token, child.stdout.strip())
 
-    def test_configure_rejects_insecure_input_before_creating_output(self):
-        for source in (
-            {"server": "http://cluster.example.invalid", "certificate-authority-data": self.ca},
-            {"server": self.endpoint, "certificate-authority-data": self.ca,
-             "insecure-skip-tls-verify": True},
-            {"server": self.endpoint, "certificate-authority-data": ""},
-        ):
-            with self.subTest(source=source):
-                result = self.configure(source)
+    def test_missing_or_empty_projected_credentials_are_rejected(self):
+        for name in ("token", "ca.crt"):
+            with self.subTest(name=name):
+                path = self.mount / name
+                original = path.read_text()
+                path.unlink()
+                result = self.configure()
                 self.assertNotEqual(0, result.returncode)
                 self.assertFalse(self.output.exists())
-                self.assertNotIn(self.token, result.stdout + result.stderr)
-
-    def test_configure_drops_exec_proxy_and_supplied_user_credentials(self):
-        marker = self.root / "exec-was-run"
-        result = self.configure({
-            "server": self.endpoint, "certificate-authority-data": self.ca,
-            "proxy-url": "https://untrusted-proxy.example.invalid",
-            "exec": {"command": "touch", "args": [str(marker)]},
-            "auth-provider": {"name": "untrusted"},
-            "users": [{"name": "untrusted", "user": {"token": "untrusted-token"}}],
-        })
-        self.assertEqual(0, result.returncode, result.stderr)
-        config = json.loads(self.output.read_text())
-        self.assertEqual({
-            "server": self.endpoint, "certificate-authority-data": self.ca,
-        }, config["clusters"][0]["cluster"])
-        self.assertEqual({"token": self.token}, config["users"][0]["user"])
-        self.assertFalse(marker.exists())
-        self.assertNotIn("untrusted", self.output.read_text())
+                path.touch()
+                result = self.configure()
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(self.output.exists())
+                path.write_text(original)
 
     def test_existing_output_is_never_overwritten(self):
         original = "existing credentials must survive\n"
@@ -451,6 +404,71 @@ class KubernetesConfigurationTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertEqual(original, self.output.read_text())
         self.assertNotIn(self.token, result.stdout + result.stderr)
+
+    def test_relative_output_and_dangling_symlink_are_rejected(self):
+        result = self.configure(KUBECONFIG="relative.kubeconfig")
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((self.root / "relative.kubeconfig").exists())
+        target = self.root / "symlink-target"
+        self.output.symlink_to(target)
+        result = self.configure()
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(target.exists())
+
+    def test_relative_service_account_mount_is_rejected(self):
+        result = self.configure(KUBE_SERVICE_ACCOUNT_DIRECTORY="relative-mount")
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self.output.exists())
+
+
+class RunnerConfigurationTests(unittest.TestCase):
+    def test_cloud_job_is_trusted_branch_only_and_has_no_aws_or_docker_steps(self):
+        workflow = (ROOT / ".github/workflows/classroom.yml").read_text()
+        images = workflow.split("\n  images:\n", 1)[1].split("\n  cloud:\n", 1)[0]
+        cloud = workflow.split("\n  cloud:\n", 1)[1]
+        for job in (images, cloud):
+            self.assertIn("github.event_name != 'pull_request'", job)
+            self.assertIn("github.ref == 'refs/heads/master'", job)
+        self.assertIn("runs-on: ubuntu-latest", images)
+        self.assertIn("runs-on: lab4-cloud-runner", cloud)
+        self.assertIn("needs: images", cloud)
+        self.assertIn("needs.images.outputs.image-tag", cloud)
+        for forbidden in ("id-token:", "configure-aws-credentials", "docker/login", "images.sh"):
+            self.assertNotIn(forbidden, cloud)
+
+    def test_runner_template_mode_never_invokes_kubectl(self):
+        with tempfile.TemporaryDirectory(prefix="lab4-runner-test-") as directory:
+            root = Path(directory)
+            events = root / "helm-calls"
+            binary_dir = root / "bin"
+            binary_dir.mkdir()
+            (binary_dir / "helm").write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "with open(os.environ['HELM_EVENTS'], 'a') as output:\n"
+                "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            )
+            (binary_dir / "kubectl").write_text("#!/usr/bin/env bash\nexit 99\n")
+            for binary in binary_dir.iterdir():
+                binary.chmod(0o755)
+            environment = dict(
+                os.environ, HELM_EVENTS=str(events),
+                PATH=str(binary_dir) + os.pathsep + os.environ["PATH"],
+            )
+            result = subprocess.run(
+                ["bash", str(ROOT / "backend/deploy/runner.sh"), "template"],
+                env=environment, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=10,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            commands = [json.loads(line) for line in events.read_text().splitlines()]
+            self.assertEqual(2, len(commands))
+            for arguments in commands:
+                self.assertEqual("template", arguments[0])
+                self.assertIn("--version", arguments)
+                self.assertIn("0.15.1", arguments)
+            self.assertEqual("arc", commands[0][1])
+            self.assertEqual("lab4-cloud-runner", commands[1][1])
 
 
 class ClassroomEnvironmentTests(unittest.TestCase):
@@ -502,7 +520,9 @@ class ClassroomEnvironmentTests(unittest.TestCase):
         preparation_environment = dict(os.environ, **self.expected)
         preparation_environment.update(
             ARBITRARY_SECRET="dummy-secret-that-must-not-be-transferred",
-            YC_IAM_TOKEN="dummy-iam-token-that-must-not-be-transferred",
+            GITHUB_PAT="dummy-arc-token-that-must-not-be-transferred",
+            AWS_SESSION_TOKEN="dummy-iam-token-that-must-not-be-transferred",
+            AWS_SECRET_ACCESS_KEY="dummy-aws-secret-that-must-not-be-transferred",
             DOCKERHUB_TOKEN="dummy-docker-token-that-must-not-be-transferred",
         )
         preparation = subprocess.run(
@@ -515,7 +535,7 @@ class ClassroomEnvironmentTests(unittest.TestCase):
         self.assertEqual(0o600, environment_file.stat().st_mode & 0o777)
         exports = re.findall(r"^export ([A-Z_]+)=", environment_file.read_text(), re.MULTILINE)
         self.assertEqual(sorted(self.expected), sorted(exports))
-        for name in ("ARBITRARY_SECRET", "YC_IAM_TOKEN", "DOCKERHUB_TOKEN"):
+        for name in ("ARBITRARY_SECRET", "GITHUB_PAT", "AWS_SESSION_TOKEN", "AWS_SECRET_ACCESS_KEY", "DOCKERHUB_TOKEN"):
             self.assertNotIn(preparation_environment[name], environment_file.read_text())
             self.assertNotIn(preparation_environment[name], preparation.stdout + preparation.stderr)
         result = self.run_classroom()

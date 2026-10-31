@@ -1,22 +1,25 @@
 # Сборка и деплой ЛР4
 
-Команды из корня репозитория. Нужны Docker + buildx, Helm, kubectl, yc, jq,
-openssl; для настройки GitHub — gh. Кластер, Traefik и StorageClass
-yc-network-ssd уже созданы. Наружу публикуется только Gateway через Ingress.
+Команды из корня репозитория. Нужны Docker + buildx, Helm, kubectl, AWS CLI v2,
+jq, openssl; для настройки GitHub — gh. EKS, EBS CSI, Traefik/NLB и StorageClass
+gp3 уже созданы. Наружу публикуется только Gateway через Ingress.
 
 ## Окружение
 
 ~~~bash
-export KUBE_CONTEXT=rsoi-lab4
+export AWS_REGION=us-east-2
+export EKS_CLUSTER_NAME=rsoi-lab4-aws
+export KUBE_CONTEXT=rsoi-lab4-aws
 export KUBE_NAMESPACE=library-system
 export DOCKERHUB_NAMESPACE=nok1o
 export DOCKERHUB_REPOSITORY=lab4_rsoi
-export BASE_URL=http://51.250.9.181  # обновить, если IP Traefik изменился
-
-yc managed-kubernetes cluster get-credentials catk60b05gm9nsj0gman \
-  --external --context-name "$KUBE_CONTEXT" --endpoint api.cloud.yandex.net:443
+aws sts get-caller-identity  # действующая локальная AWS-сессия
+aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME" \
+  --alias "$KUBE_CONTEXT"
 kubectl config use-context "$KUBE_CONTEXT"
 kubectl get nodes
+export BASE_URL="http://$(kubectl -n ingress-system get service traefik \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
 ~~~
 
 ## Сборка → push → деплой
@@ -58,54 +61,94 @@ bash backend/deploy/infrastructure.sh deploy
 
 Существующие Secrets не пересоздавать. SQL из postgres/scripts/schema-*.sql
 применяется только при первом запуске PostgreSQL на пустом диске.
-Не удалять PVC: можно потерять данные и облачный диск.
+Не удалять PVC без резервной копии. gp3 использует Retain: оставшиеся EBS-диски
+оплачиваются и после удаления PVC/кластера.
 
 ## GitHub Actions: однократная настройка
 
-IAM и OIDC уже созданы:
+Сборка/push работают на GitHub-hosted runner, Helm и success/failover — в новом
+одноразовом Pod ARC внутри EKS. AWS OIDC, access entry и AWS-ключи не нужны.
+Публичный API кластера можно оставить доступным только с твоего IP.
 
-- CI service account: ajen3g2nl7o039bakoq6.
-- Федерация: ajejtmjom45icm85fnc3.
-- Доверенный subject: repo:Nok1o@147308854/lab4_rsoi@1433093555:ref:refs/heads/master.
+Перед установкой: защитить master; Settings → Actions → General → Fork pull
+request workflows → Require approval for all external contributors. Не одобрять
+непроверенные изменения workflow. GitHub не рекомендует self-hosted runners для
+публичных репозиториев: if/labels в нашем workflow не являются изоляцией от
+другого workflow, добавленного в PR. Эта конфигурация — для короткого доверенного
+учебного стенда; Pod имеет deploy-доступ и может читать Secrets library-system.
 
-Выдать аккаунту роль только в library-system (администраторским контекстом):
+Создать fine-grained PAT: https://github.com/settings/personal-access-tokens/new.
+Resource owner Nok1o; Only select repositories → lab4_rsoi; срок 7 дней;
+Repository permissions → Administration: Read and write (Metadata — автоматически).
+Токен нужен ARC для регистрации runner, не передаётся в jobs и GitHub Secrets.
 
 ~~~bash
-ci_sa_id=ajen3g2nl7o039bakoq6
-kubectl apply -f backend/deploy/kubernetes/github-actions-role.yaml
-kubectl -n "$KUBE_NAMESPACE" create rolebinding github-actions-app-deployer \
-  --role=github-actions-app-deployer --user="$ci_sa_id" --dry-run=client -o yaml |
-  kubectl apply -f -
+kubectl --context "$KUBE_CONTEXT" create namespace arc-system --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" apply -f -
+kubectl --context "$KUBE_CONTEXT" create namespace arc-runners --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" apply -f -
 
-kubectl --as="$ci_sa_id" -n "$KUBE_NAMESPACE" \
-  auth can-i patch deployments/rating-service --subresource=scale
-kubectl --as="$ci_sa_id" -n kube-system auth can-i get secrets
+# Скрытый ввод PAT; без токена в истории команд, аргументах и локальных файлах.
+bash -euo pipefail -c '
+  read -r -s -p "GitHub PAT: " arc_pat
+  printf "\n"
+  test -n "$arc_pat"
+  printf "%s" "$arc_pat" |
+    kubectl --context "$KUBE_CONTEXT" -n arc-runners create secret generic arc-github-credentials \
+      --from-file=github_token=/dev/stdin --dry-run=client -o yaml |
+    kubectl --context "$KUBE_CONTEXT" apply -f -
+'
+
+# Отдельный образ runner: собрать/push один раз, не при каждой сборке приложения.
+docker buildx build --platform linux/amd64 \
+  --file backend/deploy/docker/ci-runner/Dockerfile \
+  --tag docker.io/nok1o/lab4_rsoi:ci-runner-v1 --load backend
+docker push docker.io/nok1o/lab4_rsoi:ci-runner-v1
+
+bash backend/deploy/runner.sh deploy
+kubectl --context "$KUBE_CONTEXT" -n arc-system get pods
+kubectl --context "$KUBE_CONTEXT" -n arc-runners get pods,autoscalingrunnersets
 ~~~
 
-Ожидаем yes, no. CI — доверенный deployer: ему доступны Secrets этого namespace.
-Защитить master; GitHub runner должен иметь сетевой доступ к API кластера и Ingress.
+runner.sh устанавливает официальный ARC controller и scale set версии 0.15.1.
+Values: backend/deploy/runner/*.yaml. minRunners=0, maxRunners=1: в простое
+работает listener; runner создаётся при появлении job lab4-cloud-runner.
+Образ содержит kubectl 1.37.1, Helm 4.3.1, Node 24 и Newman 6.2.1.
+В runner нет Docker daemon, privileged-режима, hostPath или постоянного диска.
+Для новой версии образа использовать новый tag и обновить scale-set-values.yaml.
 
-Заполнить Actions Variables/Secrets через gh (или Settings → Secrets and variables → Actions):
+ServiceAccount arc-runners/github-actions-app-deployer получает Role только
+в library-system. Его token автоматически ротируется Kubernetes; kubeconfig
+использует tokenFile. Jobs не получают прав на Secrets arc-runners/kube-system
+или RBAC. Администратор устанавливает ARC/RBAC вручную; CI их не меняет.
 
 ~~~bash
-gh variable set YC_SERVICE_ACCOUNT_ID --repo Nok1o/lab4_rsoi --body "$ci_sa_id"
+ci_user=system:serviceaccount:arc-runners:github-actions-app-deployer
+kubectl --context "$KUBE_CONTEXT" --as="$ci_user" -n library-system \
+  auth can-i patch deployments/rating-service --subresource=scale  # yes
+kubectl --context "$KUBE_CONTEXT" --as="$ci_user" -n arc-runners auth can-i get secrets  # no
+
 gh variable set APP_BASE_URL --repo Nok1o/lab4_rsoi --body "$BASE_URL"
 gh variable set DOCKERHUB_NAMESPACE --repo Nok1o/lab4_rsoi --body "$DOCKERHUB_NAMESPACE"
-gh variable set KUBE_CLUSTER_JSON --repo Nok1o/lab4_rsoi \
-  --body "$(bash backend/deploy/export-cluster-config.sh)"
-gh secret set DOCKERHUB_TOKEN --repo Nok1o/lab4_rsoi
+gh secret set DOCKERHUB_TOKEN --repo Nok1o/lab4_rsoi  # если ещё не задан
 ~~~
 
-DOCKERHUB_TOKEN — Docker Hub access token с Read & Write; вводится интерактивно.
-Постоянный ключ Yandex не нужен: workflow получает временный токен через OIDC.
-При пересоздании кластера обновить KUBE_CLUSTER_JSON.
+DOCKERHUB_TOKEN — Docker Hub access token с Read & Write, отдельный от PAT для ARC.
+Старые Actions Variables AWS_ROLE_ARN, EKS_CLUSTER_NAME, AWS_REGION,
+YC_SERVICE_ACCOUNT_ID и KUBE_CLUSTER_JSON больше не используются.
 
-Push в master: проверки → build/push образов → Helm deploy → success/failover.
-PR: только локальные проверки. Ручной запуск после публикации изменений:
+Push в master: проверки → build/push четырёх образов → Helm deploy → success/failover.
+PR: только локальные проверки. После публикации workflow:
 
 ~~~bash
 gh workflow run classroom.yml --repo Nok1o/lab4_rsoi --ref master
+gh run list --repo Nok1o/lab4_rsoi --workflow classroom.yml --limit 3
 ~~~
+
+Если cloud job ожидает runner: проверить listener/controller logs и срок PAT.
+Для замены истёкшего PAT повторить скрытый ввод Secret, затем runner.sh deploy.
+После сдачи: helm uninstall lab4-cloud-runner -n arc-runners, затем
+helm uninstall arc -n arc-system; отозвать PAT. Инфраструктуру и PVC это не удаляет.
 
 ## Тесты и диагностика
 
@@ -128,3 +171,7 @@ kubectl -n "$KUBE_NAMESPACE" get events --sort-by=.lastTimestamp
 Скрипт восстанавливает Rating и возвращает незавершённые аренды своего CI-пользователя.
 Перед позитивными failover-этапами ждёт успешного чтения рейтинга через Gateway.
 При обрыве runner/сети проверить replicas вручную; отчёты — в artifacts workflow.
+
+Источники: [ARC](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets),
+[GitHub PAT для ARC](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api),
+[ServiceAccount](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/).

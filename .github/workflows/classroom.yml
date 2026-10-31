@@ -40,31 +40,21 @@ jobs:
         run: |
           bash backend/deploy/infrastructure.sh lint
           bash backend/deploy/application.sh lint
+          bash backend/deploy/runner.sh template > /dev/null
 
-  cloud:
-    name: Autograding
+  images:
+    name: Build and publish images
     needs: check
-    # No cloud credentials or Docker Hub token are available to PR jobs.
+    # PRs must never publish images or target the privileged in-cluster runner.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      id-token: write
-      actions: read
-      checks: write
-    concurrency:
-      # Serialize every deploy/test targeting the same shared environment.
-      group: lab4-cloud-library-system
-      cancel-in-progress: false
+    timeout-minutes: 30
+    outputs:
+      image-tag: ${{ steps.version.outputs.image_tag }}
     env:
       DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'nok1o' }}
       DOCKERHUB_REPOSITORY: lab4_rsoi
       IMAGE_TAG: sha-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-      KUBE_NAMESPACE: library-system
-      BASE_URL: ${{ vars.APP_BASE_URL }}
-      KUBE_CLUSTER_JSON: ${{ vars.KUBE_CLUSTER_JSON }}
-      YC_SERVICE_ACCOUNT_ID: ${{ vars.YC_SERVICE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Check required configuration
@@ -72,11 +62,9 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           : "${DOCKERHUB_TOKEN:?Add the DOCKERHUB_TOKEN repository secret}"
-          : "${BASE_URL:?Add the APP_BASE_URL repository variable (Gateway Ingress URL)}"
-          : "${KUBE_CLUSTER_JSON:?Add KUBE_CLUSTER_JSON using export-cluster-config.sh}"
-          : "${YC_SERVICE_ACCOUNT_ID:?Add the dedicated IAM service account ID}"
-          echo "TEST_REPORT_DIR=$RUNNER_TEMP/lab4-test-reports" >> "$GITHUB_ENV"
-          echo "KUBECONFIG=$RUNNER_TEMP/lab4-ci.kubeconfig" >> "$GITHUB_ENV"
+      - name: Record immutable image version
+        id: version
+        run: echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -86,20 +74,43 @@ jobs:
         run: bash backend/deploy/images.sh build
       - name: Push the same images
         run: bash backend/deploy/images.sh push
-      - uses: azure/setup-kubectl@v4
+
+  cloud:
+    name: Autograding
+    needs: images
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    # ARC scale-set name, not a GitHub-hosted runner or a Docker-enabled runner.
+    runs-on: lab4-cloud-runner
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    concurrency:
+      # Serialize every deploy/test targeting the same shared environment.
+      group: lab4-cloud-library-system
+      cancel-in-progress: false
+    env:
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'nok1o' }}
+      DOCKERHUB_REPOSITORY: lab4_rsoi
+      IMAGE_TAG: ${{ needs.images.outputs.image-tag }}
+      KUBE_NAMESPACE: library-system
+      BASE_URL: ${{ vars.APP_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          version: v1.35.1
-      - uses: azure/setup-helm@v4.3.1
-        with:
-          version: v4.3.1
-      - name: Exchange GitHub OIDC identity for a temporary Yandex IAM token
-        id: iam
-        uses: docker://ghcr.io/yc-actions/yc-iam-token-fed:1.0.0
-        with:
-          yc-sa-id: ${{ env.YC_SERVICE_ACCOUNT_ID }}
+          persist-credentials: false
+      - name: Check runner tools and test configuration
+        run: |
+          : "${BASE_URL:?Add the APP_BASE_URL repository variable (Gateway Ingress URL)}"
+          : "${IMAGE_TAG:?The images job must publish an image tag}"
+          for tool in kubectl helm newman curl jq openssl; do
+            command -v "$tool"
+          done
+          echo "TEST_REPORT_DIR=$RUNNER_TEMP/lab4-test-reports" >> "$GITHUB_ENV"
+          echo "KUBECONFIG=$RUNNER_TEMP/lab4-ci.kubeconfig" >> "$GITHUB_ENV"
       - name: Configure Kubernetes access for this job only
-        env:
-          YC_IAM_TOKEN: ${{ steps.iam.outputs.token }}
+        id: kubeconfig
         run: bash backend/deploy/configure-ci-kubeconfig.sh
       - name: Verify identity, namespace access and privilege boundary
         run: |
@@ -107,6 +118,12 @@ jobs:
           kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" get deployments
           test "$(kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" \
             auth can-i patch deployments/rating-service --subresource=scale)" = yes
+          if answer="$(kubectl --request-timeout=15s -n arc-runners auth can-i get secrets)"; then
+            echo "Runner jobs must not read ARC's GitHub credential Secret." >&2
+            exit 1
+          else
+            test "$answer" = no
+          fi
           if answer="$(kubectl --request-timeout=15s -n kube-system auth can-i get secrets)"; then
             echo "CI must not have access to kube-system Secrets." >&2
             exit 1
@@ -121,11 +138,6 @@ jobs:
           fi
       - name: Deploy all four services and wait for readiness
         run: bash backend/deploy/application.sh deploy
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - name: Install Newman
-        run: npm install --global newman@6.2.1
       - name: Save Rating replica count for emergency recovery
         id: rating
         run: |
@@ -153,7 +165,7 @@ jobs:
           kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" rollout status \
             deployment/rating-service --timeout=180s
       - name: Collect diagnostics on failure
-        if: failure() && steps.iam.outcome == 'success'
+        if: failure() && steps.kubeconfig.outcome == 'success'
         continue-on-error: true
         run: |
           kubectl --request-timeout=15s -n "$KUBE_NAMESPACE" get pods,svc,ingress
