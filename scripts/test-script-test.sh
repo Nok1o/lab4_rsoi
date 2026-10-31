@@ -152,6 +152,9 @@ elif command == "curl":
             "availableCount": 1 if os.environ.get("UNAVAILABLE_BOOK") != "1" else 0
         }]})
         status = "200"
+    elif path.endswith("/libraries"):
+        body = json.dumps({"items": [{"libraryUid": "83575e12-7ce0-48ee-9931-51919ff3c9ee"}]})
+        status = "200"
     elif path.endswith("/rating"):
         if option("--header") != "X-User-Name: " + state.get("username", "ci-mock"):
             sys.exit("Rating readiness must use the isolated test user")
@@ -168,14 +171,41 @@ elif command == "curl":
         body, status = "{}", "200"
     else:
         sys.exit("unexpected curl URL: " + url)
+    write_out = option("--write-out", option("-w"))
+    curl_exit = 0
+    if write_out == "%{json}":
+        assert method == "GET", "Startup readiness must never retry mutations"
+        probe = "books" if path.endswith("/books") else (
+            "libraries" if path.endswith("/libraries") else "health")
+        if probe == os.environ.get("STARTUP_PROBE_TARGET", "books"):
+            state["startup_probes"] = state.get("startup_probes", 0) + 1
+            responses = os.environ.get("STARTUP_PROBE_RESPONSES", "200").split(",")
+            response = responses[min(state["startup_probes"] - 1, len(responses) - 1)]
+            if response == "timeout":
+                status, curl_exit = "0", 28
+                print("curl: (28) simulated timeout", file=sys.stderr)
+            else:
+                status = response
+            if status != "200":
+                body = "Bad Gateway" if status == "502" else '{"message":"not ready"}'
+            elif os.environ.get("STARTUP_PROBE_INVALID_BODY") == "1":
+                body = '{"items":"not an array"}'
+        event("ingress_probe", probe=probe, status=int(status), curl_exit=curl_exit, method=method)
+        save()
     destination = option("--output", option("-o"))
     if destination:
         Path(destination).write_text(body)
     else:
         print(body, end="")
-    write_out = option("--write-out", option("-w"))
-    if write_out:
+    header_destination = option("--dump-header")
+    if header_destination:
+        Path(header_destination).write_text("HTTP/1.1 " + status + "\r\nServer: mock-ingress\r\n\r\n")
+    if write_out == "%{json}":
+        print(json.dumps({"http_code": int(status), "remote_ip": "192.0.2.10",
+                          "time_connect": 0.001, "time_total": 0.002}), end="")
+    elif write_out:
         print(write_out.replace("%{http_code}", status), end="")
+    sys.exit(curl_exit)
 else:
     sys.exit("unexpected mock command: " + command)
 '''
@@ -201,6 +231,7 @@ class CloudScenarioTests(unittest.TestCase):
                 BASE_URL="https://cloud.example.invalid",
                 SOURCE_COLLECTION=str(ROOT / "v4/postman/collection.json"),
                 TEST_REPORT_DIR=str(root / "reports"),
+                TEST_STARTUP_WAIT_TIMEOUT="30",
             )
             environment.update(overrides)
             result = subprocess.run(
@@ -211,6 +242,11 @@ class CloudScenarioTests(unittest.TestCase):
             events_path = root / "events.jsonl"
             events = [json.loads(line) for line in events_path.read_text().splitlines()]
             state = json.loads((root / "state.json").read_text())
+            diagnostics = root / "reports/ingress-readiness.jsonl"
+            state["ingress_diagnostics"] = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+            state["ingress_reports"] = {
+                path.name: path.read_text() for path in (root / "reports/ingress-readiness").iterdir()
+            }
             for path, original in before.items():
                 self.assertEqual(original, path.read_bytes(), "source fixture was modified: " + str(path))
             return result, events, state
@@ -278,6 +314,57 @@ class CloudScenarioTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode, result.stdout)
         self.assertFalse(any(event["kind"] in ("folder", "return") for event in events))
         self.assertEqual(2, state["replicas"])
+
+    def test_ingress_502_resets_success_streak_and_preserves_diagnostics(self):
+        result, events, state = self.run_scenario(STARTUP_PROBE_RESPONSES="200,502,200,200,200")
+        self.assertEqual(0, result.returncode, result.stdout)
+        probes = [event["status"] for event in events
+                  if event["kind"] == "ingress_probe" and event["probe"] == "books"]
+        self.assertEqual([200, 502, 200, 200, 200], probes)
+        failures = [probe for probe in state["ingress_diagnostics"] if probe["httpStatus"] == 502]
+        self.assertEqual(1, len(failures))
+        self.assertEqual("192.0.2.10", failures[0]["remoteIp"])
+        self.assertEqual(0.002, failures[0]["totalSeconds"])
+        self.assertIn("/books?", failures[0]["url"])
+        self.assertEqual("Bad Gateway", state["ingress_reports"]["2-books.body"])
+        self.assertIn("502", state["ingress_reports"]["2-books.headers"])
+
+    def test_ingress_retries_health_502_before_probing_application(self):
+        result, events, state = self.run_scenario(
+            STARTUP_PROBE_TARGET="health", STARTUP_PROBE_RESPONSES="502,200")
+        self.assertEqual(0, result.returncode, result.stdout)
+        probes = [event for event in events if event["kind"] == "ingress_probe"]
+        self.assertEqual(("health", 502), (probes[0]["probe"], probes[0]["status"]))
+        self.assertEqual(("health", 200), (probes[1]["probe"], probes[1]["status"]))
+
+    def test_ingress_retries_network_timeout_and_keeps_curl_error(self):
+        result, events, state = self.run_scenario(STARTUP_PROBE_RESPONSES="timeout,200")
+        self.assertEqual(0, result.returncode, result.stdout)
+        failures = [probe for probe in state["ingress_diagnostics"] if probe["curlExit"] == 28]
+        self.assertEqual(1, len(failures))
+        self.assertIn("simulated timeout", state["ingress_reports"]["1-books.stderr"])
+
+    def test_ingress_permanent_error_fails_before_newman(self):
+        result, events, state = self.run_scenario(STARTUP_PROBE_RESPONSES="400")
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertEqual(1, state["startup_probes"])
+        self.assertFalse(any(event["kind"] in ("folder", "return") for event in events))
+        self.assertEqual(2, state["replicas"])
+
+    def test_ingress_persistent_502_times_out_without_starting_newman(self):
+        result, events, state = self.run_scenario(
+            STARTUP_PROBE_RESPONSES="502", TEST_STARTUP_WAIT_TIMEOUT="1", MOCK_SLEEP_REAL="1")
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertIn("Timed out waiting for stable Ingress", result.stdout)
+        self.assertFalse(any(event["kind"] in ("folder", "return") for event in events))
+        self.assertEqual(2, state["replicas"])
+
+    def test_ingress_invalid_200_body_is_not_retried_or_accepted(self):
+        result, events, state = self.run_scenario(STARTUP_PROBE_INVALID_BODY="1")
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertIn("invalid page body", result.stdout)
+        self.assertEqual(1, state["startup_probes"])
+        self.assertFalse(any(event["kind"] == "folder" for event in events))
 
     def test_rating_readiness_retries_temporary_503_before_step2(self):
         result, events, state = self.run_scenario(RATING_PROBE_FAILURES="2")

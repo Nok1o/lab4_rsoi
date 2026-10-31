@@ -1,4 +1,13 @@
 replicaCount: 1
+# Keep the new Pod Ready before replacing the old replica.
+minReadySeconds: 5
+terminationGracePeriodSeconds: 30
+# All four application images include Alpine's /bin/sleep. Keep serving while
+# EndpointSlice/Ingress updates propagate, then let Go handle SIGTERM normally.
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sleep", "5"]
 
 image:
   registry: docker.io

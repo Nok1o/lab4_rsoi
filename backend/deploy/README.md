@@ -170,6 +170,12 @@ kubectl -n "$KUBE_NAMESPACE" get events --sort-by=.lastTimestamp
 Не запускать параллельно с CI; seed-книга должна быть свободна и в EXCELLENT.
 Скрипт восстанавливает Rating и возвращает незавершённые аренды своего CI-пользователя.
 Перед позитивными failover-этапами ждёт успешного чтения рейтинга через Gateway.
+После деплоя: до 180 с на 3 подряд успешных раунда GET health/libraries/books
+через Ingress; лимит задаётся TEST_STARTUP_WAIT_TIMEOUT. Только подготовительные
+GET повторяются при временных ошибках, Newman и POST — без повторов.
+HTTP-коды, IP и длительность — ingress-readiness.jsonl, тела/заголовки/ошибки —
+ingress-readiness/ в artifacts. Chart: minReadySeconds=5, preStop sleep=5 с;
+затем выполняется существующий graceful shutdown Go.
 При обрыве runner/сети проверить replicas вручную; отчёты — в artifacts workflow.
 
 Источники: [ARC](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets),

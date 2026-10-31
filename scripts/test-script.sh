@@ -15,8 +15,9 @@ if [[ ! "$base_url" =~ ^https?:// ]]; then
   exit 2
 fi
 wait_timeout="${TEST_WAIT_TIMEOUT:-180}"
-if [[ ! "$wait_timeout" =~ ^[1-9][0-9]*$ ]]; then
-  echo "TEST_WAIT_TIMEOUT must be a positive number of seconds." >&2
+startup_timeout="${TEST_STARTUP_WAIT_TIMEOUT:-$wait_timeout}"
+if [[ ! "$wait_timeout" =~ ^[1-9][0-9]*$ || ! "$startup_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TEST_WAIT_TIMEOUT and TEST_STARTUP_WAIT_TIMEOUT must be positive seconds." >&2
   exit 2
 fi
 for command in kubectl newman curl jq openssl; do
@@ -40,6 +41,70 @@ kube() {
 api() {
   curl --fail-with-body --silent --show-error --connect-timeout 5 --max-time 20 \
     --header "X-User-Name: $test_username" "$@"
+}
+wait_for_ingress() {
+  local deadline=$((SECONDS + startup_timeout)) attempt=0 streak=0 healthy
+  local probe probe_path prefix remaining max_time metrics http_status curl_status result
+  mkdir -p "$report_directory/ingress-readiness"
+  echo "Waiting for 3 consecutive successful Ingress probe rounds (GET only)."
+  while (( SECONDS < deadline )); do
+    attempt=$((attempt + 1))
+    healthy=1
+    for probe in health libraries books; do
+      case "$probe" in
+        health) probe_path=/manage/health ;;
+        libraries) probe_path='/api/v1/libraries?page=1&size=10&city=%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0' ;;
+        books) probe_path="/api/v1/libraries/$library_uid/books?showAll=true&page=1&size=100" ;;
+      esac
+      remaining=$((deadline - SECONDS))
+      if (( remaining <= 0 )); then healthy=0; break; fi
+      max_time=$((remaining < 10 ? remaining : 10))
+      prefix="$report_directory/ingress-readiness/$attempt-$probe"
+      curl_status=0
+      metrics="$(curl --silent --show-error --connect-timeout 5 --max-time "$max_time" \
+        --header "X-User-Name: $test_username" --output "$prefix.body" \
+        --dump-header "$prefix.headers" --write-out '%{json}' \
+        "$base_url$probe_path" 2>"$prefix.stderr")" || curl_status=$?
+      if ! jq -e 'type == "object"' <<< "$metrics" >/dev/null 2>&1; then metrics='{}'; fi
+      http_status="$(jq -r '.http_code // 0' <<< "$metrics")"
+      jq --null-input --compact-output --arg url "$base_url$probe_path" \
+        --argjson attempt "$attempt" --argjson curlExit "$curl_status" --argjson metrics "$metrics" \
+        '{attempt: $attempt, url: $url, curlExit: $curlExit,
+          httpStatus: ($metrics.http_code // 0), remoteIp: $metrics.remote_ip,
+          connectSeconds: $metrics.time_connect, totalSeconds: $metrics.time_total}' \
+        >> "$report_directory/ingress-readiness.jsonl"
+      result=retry
+      if (( curl_status == 0 )); then
+        case "$http_status" in
+          200) result=ready ;;
+          429|5??) ;;
+          *) result=fatal ;;
+        esac
+      else
+        case "$curl_status" in
+          5|6|7|18|28|52|55|56) ;; # DNS, connection, timeout or interrupted transfer.
+          *) result=fatal ;;
+        esac
+      fi
+      if [[ "$result" != ready ]]; then
+        echo "Ingress $probe: HTTP=$http_status curl=$curl_status URL=$base_url$probe_path; details=$prefix.*"
+        [[ "$result" == fatal ]] && return 1
+        healthy=0
+        break
+      fi
+      if [[ "$probe" != health ]] && ! jq -e '.items | type == "array"' "$prefix.body" >/dev/null; then
+        echo "Ingress $probe returned HTTP 200 with an invalid page body; details=$prefix.*" >&2
+        return 1
+      fi
+      if [[ "$probe" == books ]]; then books="$(< "$prefix.body")"; fi
+    done
+    if (( healthy )); then streak=$((streak + 1)); else streak=0; fi
+    echo "Ingress readiness: $streak/3 consecutive rounds."
+    (( streak == 3 )) && return 0
+    (( SECONDS < deadline )) && sleep 1
+  done
+  echo "Timed out waiting for stable Ingress; see $report_directory/ingress-readiness*." >&2
+  return 1
 }
 wait_for_rating() {
   local deadline=$((SECONDS + wait_timeout)) status
@@ -171,10 +236,9 @@ jq --null-input --arg user "$test_username" --arg base "$base_url" \
 echo "Testing $base_url in namespace=$namespace, username=$test_username."
 kube rollout status "deployment/$deployment" --timeout="${wait_timeout}s"
 wait_for_endpoints up
-curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
-  --retry 12 --retry-delay 2 --retry-all-errors "$base_url/manage/health" >/dev/null
+books=""
+wait_for_ingress
 # Do not cancel someone else's reservation to make the suite pass.
-books="$(api "$base_url/api/v1/libraries/$library_uid/books?showAll=true&page=1&size=100")"
 if ! jq -e --arg book "$book_uid" \
   '.items[] | select(.bookUid == $book and .availableCount > 0 and .condition == "EXCELLENT")' \
   <<< "$books" >/dev/null; then

@@ -6,6 +6,7 @@ metadata:
     {{- include "http-service.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
   revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
@@ -21,7 +22,7 @@ spec:
         {{- include "http-service.selectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -36,6 +37,10 @@ spec:
         - name: service
           image: {{ include "http-service.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
